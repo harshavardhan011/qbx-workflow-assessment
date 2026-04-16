@@ -1,0 +1,276 @@
+{
+  "name": "Incident Notifier — Offline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "incident",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "wh-01",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 400],
+      "webhookId": "incident-webhook-001"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ── Validate required fields ──────────────────────────────────────\nconst required = ['incidentId', 'severity', 'title', 'createdAt'];\nfor (const field of required) {\n  if (!$json[field]) {\n    throw new Error(`Missing required field: ${field}`);\n  }\n}\n\n// ── Severity mapping: P1->1, P2->2, P3->3, P4->4 ──────────────────\nconst sevMap = { P1: 1, P2: 2, P3: 3, P4: 4 };\nconst severityRank = sevMap[$json.severity];\nif (!severityRank) {\n  throw new Error(`Invalid severity: \"${$json.severity}\". Expected P1, P2, P3, or P4.`);\n}\n\n// ── dedupeKey formula: incidentId|severity|title ──────────────────\nconst dedupeKey = `${$json.incidentId}|${$json.severity}|${$json.title}`;\n\n// ── Truncate description to 240 chars ─────────────────────────────\nconst desc = $json.description || '';\nconst descriptionShort = desc.length > 240 ? desc.slice(0, 237) + '...' : desc;\n\n// ── Build clean notification message ──────────────────────────────\nconst correlationId = $json.metadata?.correlationId || '';\nconst notificationMessage = `[${$json.severity}] ${$json.incidentId} — ${$json.title} (corr=${correlationId})`;\n\nreturn [{\n  json: {\n    ...$json,\n    severityRank,\n    dedupeKey,\n    descriptionShort,\n    correlationId,\n    notificationMessage\n  }\n}];"
+      },
+      "id": "norm-01",
+      "name": "Normalize Incident",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 400]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ── Check if this incident was already processed (idempotency) ─────\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.processedKeys) {\n  staticData.processedKeys = {};\n}\n\nconst dedupeKey = $json.dedupeKey;\nconst isDuplicate = Boolean(staticData.processedKeys[dedupeKey]);\n\nreturn [{ json: { ...$json, isDuplicate } }];"
+      },
+      "id": "dd-01",
+      "name": "Dedupe Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "dd-cond-1",
+              "leftValue": "={{ $json.isDuplicate }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ifdd-01",
+      "name": "Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [860, 400]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'skipped', reason: 'duplicate', dedupeKey: $json.dedupeKey, incidentId: $json.incidentId }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "resp-dup-01",
+      "name": "Already Processed",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1080, 220]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ── Slack Notify with Exponential-Backoff Retry ──────────────────\n// Retries on 429 (rate-limited) and 5xx (server errors).\n// Does NOT retry on other 4xx (client errors).\n// Max attempts: 5.  Backoff: 1s, 2s, 4s, 8s, 16s.\n\nconst incident = $json;\nconst url = 'http://localhost:4010/chat.postMessage';\nconst headers = {\n  'Authorization': 'Bearer slack-test-token',\n  'Content-Type': 'application/json'\n};\nconst payload = {\n  channel: '#oncall-alerts',\n  text: incident.notificationMessage\n};\n\nconst MAX_RETRIES = 5;\n\nfor (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {\n  const response = await fetch(url, {\n    method: 'POST',\n    headers,\n    body: JSON.stringify(payload)\n  });\n\n  if (response.status >= 200 && response.status < 300) {\n    return [{ json: { ...incident, slackStatus: 'success', slackAttempts: attempt } }];\n  }\n\n  const retryable = response.status === 429 || response.status >= 500;\n  if (retryable && attempt < MAX_RETRIES) {\n    const delayMs = Math.pow(2, attempt - 1) * 1000;\n    await new Promise(resolve => setTimeout(resolve, delayMs));\n    continue;\n  }\n\n  return [{ json: { ...incident, slackStatus: 'failed', slackStatusCode: response.status, slackAttempts: attempt } }];\n}\n\nreturn [{ json: { ...incident, slackStatus: 'failed', slackAttempts: MAX_RETRIES } }];"
+      },
+      "id": "slk-01",
+      "name": "Slack Notify",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1080, 560]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "slk-cond-1",
+              "leftValue": "={{ $json.slackStatus }}",
+              "rightValue": "success",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ifslk-01",
+      "name": "Slack OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1300, 560]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ── Persist Slack failure in workflow static data ────────────────\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.failures) staticData.failures = [];\n\nconst record = {\n  timestamp: new Date().toISOString(),\n  incidentId: $json.incidentId,\n  service: 'slack',\n  statusCode: $json.slackStatusCode ?? null,\n  attempts: $json.slackAttempts\n};\n\nstaticData.failures.push(record);\n\nconsole.error(\n  `[FAILURE] Slack | incident=${record.incidentId} | attempts=${record.attempts} | status=${record.statusCode}`\n);\n\nreturn [{ json: $json }];"
+      },
+      "id": "logslk-01",
+      "name": "Log Slack Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1520, 720]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ── O365 Email with Exponential-Backoff Retry ────────────────────\n// Retries on 429 and 5xx only.  Max attempts: 5.\n\nconst incident = $json;\nconst url = 'http://localhost:4020/me/sendMail';\nconst headers = {\n  'Authorization': 'Bearer ms-test-token',\n  'Content-Type': 'application/json'\n};\nconst payload = {\n  message: {\n    subject: `[${incident.severity}] ${incident.incidentId} — ${incident.title}`,\n    body: {\n      contentType: 'Text',\n      content: `${incident.descriptionShort}\\n\\nCorrelationId: ${incident.correlationId}\\nCreatedAt: ${incident.createdAt}`\n    },\n    toRecipients: [{ emailAddress: { address: incident.ownerEmail } }]\n  },\n  saveToSentItems: false\n};\n\nconst MAX_RETRIES = 5;\n\nfor (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {\n  const response = await fetch(url, {\n    method: 'POST',\n    headers,\n    body: JSON.stringify(payload)\n  });\n\n  if (response.status >= 200 && response.status < 300) {\n    return [{ json: { ...incident, o365Status: 'success', o365Attempts: attempt } }];\n  }\n\n  const retryable = response.status === 429 || response.status >= 500;\n  if (retryable && attempt < MAX_RETRIES) {\n    const delayMs = Math.pow(2, attempt - 1) * 1000;\n    await new Promise(resolve => setTimeout(resolve, delayMs));\n    continue;\n  }\n\n  return [{ json: { ...incident, o365Status: 'failed', o365StatusCode: response.status, o365Attempts: attempt } }];\n}\n\nreturn [{ json: { ...incident, o365Status: 'failed', o365Attempts: MAX_RETRIES } }];"
+      },
+      "id": "o365-01",
+      "name": "O365 Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1740, 560]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "o365-cond-1",
+              "leftValue": "={{ $json.o365Status }}",
+              "rightValue": "success",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ifo365-01",
+      "name": "O365 OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1960, 560]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ── Persist O365 failure in workflow static data ─────────────────\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.failures) staticData.failures = [];\n\nconst record = {\n  timestamp: new Date().toISOString(),\n  incidentId: $json.incidentId,\n  service: 'o365',\n  statusCode: $json.o365StatusCode ?? null,\n  attempts: $json.o365Attempts\n};\n\nstaticData.failures.push(record);\n\nconsole.error(\n  `[FAILURE] O365 | incident=${record.incidentId} | attempts=${record.attempts} | status=${record.statusCode}`\n);\n\nreturn [{ json: $json }];"
+      },
+      "id": "logo365-01",
+      "name": "Log O365 Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2180, 720]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ── Mark dedupeKey as processed so replays are skipped ───────────\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.processedKeys) staticData.processedKeys = {};\n\nstaticData.processedKeys[$json.dedupeKey] = new Date().toISOString();\n\nreturn [{ json: $json }];"
+      },
+      "id": "recdd-01",
+      "name": "Record Dedupe Key",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2400, 560]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'ok', incidentId: $json.incidentId, slack: $json.slackStatus, o365: $json.o365Status, dedupeKey: $json.dedupeKey }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "resp-ok-01",
+      "name": "Respond Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2620, 560]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [{ "node": "Normalize Incident", "type": "main", "index": 0 }]
+      ]
+    },
+    "Normalize Incident": {
+      "main": [
+        [{ "node": "Dedupe Check", "type": "main", "index": 0 }]
+      ]
+    },
+    "Dedupe Check": {
+      "main": [
+        [{ "node": "Duplicate?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Duplicate?": {
+      "main": [
+        [{ "node": "Already Processed", "type": "main", "index": 0 }],
+        [{ "node": "Slack Notify",       "type": "main", "index": 0 }]
+      ]
+    },
+    "Slack Notify": {
+      "main": [
+        [{ "node": "Slack OK?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Slack OK?": {
+      "main": [
+        [{ "node": "O365 Email",       "type": "main", "index": 0 }],
+        [{ "node": "Log Slack Failure", "type": "main", "index": 0 }]
+      ]
+    },
+    "Log Slack Failure": {
+      "main": [
+        [{ "node": "O365 Email", "type": "main", "index": 0 }]
+      ]
+    },
+    "O365 Email": {
+      "main": [
+        [{ "node": "O365 OK?", "type": "main", "index": 0 }]
+      ]
+    },
+    "O365 OK?": {
+      "main": [
+        [{ "node": "Record Dedupe Key", "type": "main", "index": 0 }],
+        [{ "node": "Log O365 Failure",  "type": "main", "index": 0 }]
+      ]
+    },
+    "Log O365 Failure": {
+      "main": [
+        [{ "node": "Record Dedupe Key", "type": "main", "index": 0 }]
+      ]
+    },
+    "Record Dedupe Key": {
+      "main": [
+        [{ "node": "Respond Success", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "versionId": "v1.0.0"
+}
