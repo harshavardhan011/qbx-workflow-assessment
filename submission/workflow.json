@@ -17,8 +17,8 @@
     },
     {
       "parameters": {
-        "mode": "runOnceForEachItem",
-        "jsCode": "// ── Validate required fields ──────────────────────────────────────\nconst required = ['incidentId', 'severity', 'title', 'createdAt'];\nfor (const field of required) {\n  if (!$json[field]) {\n    throw new Error(`Missing required field: ${field}`);\n  }\n}\n\n// ── Severity mapping: P1->1, P2->2, P3->3, P4->4 ──────────────────\nconst sevMap = { P1: 1, P2: 2, P3: 3, P4: 4 };\nconst severityRank = sevMap[$json.severity];\nif (!severityRank) {\n  throw new Error(`Invalid severity: \"${$json.severity}\". Expected P1, P2, P3, or P4.`);\n}\n\n// ── dedupeKey formula: incidentId|severity|title ──────────────────\nconst dedupeKey = `${$json.incidentId}|${$json.severity}|${$json.title}`;\n\n// ── Truncate description to 240 chars ─────────────────────────────\nconst desc = $json.description || '';\nconst descriptionShort = desc.length > 240 ? desc.slice(0, 237) + '...' : desc;\n\n// ── Build clean notification message ──────────────────────────────\nconst correlationId = $json.metadata?.correlationId || '';\nconst notificationMessage = `[${$json.severity}] ${$json.incidentId} — ${$json.title} (corr=${correlationId})`;\n\nreturn [{\n  json: {\n    ...$json,\n    severityRank,\n    dedupeKey,\n    descriptionShort,\n    correlationId,\n    notificationMessage\n  }\n}];"
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Webhook wraps POST body under $json.body; fall back to $json for direct invocations.\nconst incident = $json.body || $json;\n\n// ── Validate required fields ──────────────────────────────────────\nconst required = ['incidentId', 'severity', 'title', 'createdAt'];\nfor (const field of required) {\n  if (!incident[field]) {\n    throw new Error(`Missing required field: ${field}`);\n  }\n}\n\n// ── Severity mapping: P1->1, P2->2, P3->3, P4->4 ──────────────────\nconst sevMap = { P1: 1, P2: 2, P3: 3, P4: 4 };\nconst severityRank = sevMap[incident.severity];\nif (!severityRank) {\n  throw new Error(`Invalid severity: \"${incident.severity}\". Expected P1, P2, P3, or P4.`);\n}\n\n// ── dedupeKey formula: incidentId|severity|title ──────────────────\nconst dedupeKey = `${incident.incidentId}|${incident.severity}|${incident.title}`;\n\n// ── Truncate description to 240 chars ─────────────────────────────\nconst desc = incident.description || '';\nconst descriptionShort = desc.length > 240 ? desc.slice(0, 237) + '...' : desc;\n\n// ── Build clean notification message ──────────────────────────────\nconst correlationId = incident.metadata?.correlationId || '';\nconst notificationMessage = `[${incident.severity}] ${incident.incidentId} — ${incident.title} (corr=${correlationId})`;\n\nreturn [{\n  json: {\n    ...incident,\n    severityRank,\n    dedupeKey,\n    descriptionShort,\n    correlationId,\n    notificationMessage\n  }\n}];"
       },
       "id": "norm-01",
       "name": "Normalize Incident",
@@ -28,7 +28,7 @@
     },
     {
       "parameters": {
-        "mode": "runOnceForEachItem",
+        "mode": "runOnceForAllItems",
         "jsCode": "// ── Check if this incident was already processed (idempotency) ─────\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.processedKeys) {\n  staticData.processedKeys = {};\n}\n\nconst dedupeKey = $json.dedupeKey;\nconst isDuplicate = Boolean(staticData.processedKeys[dedupeKey]);\n\nreturn [{ json: { ...$json, isDuplicate } }];"
       },
       "id": "dd-01",
@@ -82,8 +82,8 @@
     },
     {
       "parameters": {
-        "mode": "runOnceForEachItem",
-        "jsCode": "// ── Slack Notify with Exponential-Backoff Retry ──────────────────\n// Retries on 429 (rate-limited) and 5xx (server errors).\n// Does NOT retry on other 4xx (client errors).\n// Max attempts: 5.  Backoff: 1s, 2s, 4s, 8s, 16s.\n\nconst incident = $json;\nconst url = 'http://localhost:4010/chat.postMessage';\nconst headers = {\n  'Authorization': 'Bearer slack-test-token',\n  'Content-Type': 'application/json'\n};\nconst payload = {\n  channel: '#oncall-alerts',\n  text: incident.notificationMessage\n};\n\nconst MAX_RETRIES = 5;\n\nfor (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {\n  const response = await fetch(url, {\n    method: 'POST',\n    headers,\n    body: JSON.stringify(payload)\n  });\n\n  if (response.status >= 200 && response.status < 300) {\n    return [{ json: { ...incident, slackStatus: 'success', slackAttempts: attempt } }];\n  }\n\n  const retryable = response.status === 429 || response.status >= 500;\n  if (retryable && attempt < MAX_RETRIES) {\n    const delayMs = Math.pow(2, attempt - 1) * 1000;\n    await new Promise(resolve => setTimeout(resolve, delayMs));\n    continue;\n  }\n\n  return [{ json: { ...incident, slackStatus: 'failed', slackStatusCode: response.status, slackAttempts: attempt } }];\n}\n\nreturn [{ json: { ...incident, slackStatus: 'failed', slackAttempts: MAX_RETRIES } }];"
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ── Slack Notify with Exponential-Backoff Retry ──────────────────\n// Retries on 429 (rate-limited) and 5xx (server errors).\n// Does NOT retry on other 4xx (client errors).\n// Max attempts: 5.  Backoff: 1s, 2s, 4s, 8s, 16s.\n\nconst incident = $json;\nconst url = 'http://localhost:4010/chat.postMessage';\nconst headers = {\n  'Authorization': 'Bearer slack-test-token',\n  'Content-Type': 'application/json'\n};\nconst body = {\n  channel: '#oncall-alerts',\n  text: incident.notificationMessage\n};\n\nconst MAX_RETRIES = 5;\n\nfor (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {\n  let statusCode;\n  try {\n    const response = await this.helpers.httpRequest({\n      method: 'POST',\n      url,\n      headers,\n      body,\n      json: true,\n      returnFullResponse: true,\n      ignoreHttpStatusErrors: true\n    });\n    statusCode = response.statusCode;\n  } catch (err) {\n    statusCode = 0; // network error → treat as retryable\n  }\n\n  if (statusCode >= 200 && statusCode < 300) {\n    return [{ json: { ...incident, slackStatus: 'success', slackAttempts: attempt } }];\n  }\n\n  const retryable = statusCode === 0 || statusCode === 429 || statusCode >= 500;\n  if (retryable && attempt < MAX_RETRIES) {\n    const delayMs = Math.pow(2, attempt - 1) * 1000;\n    if (typeof setTimeout === 'function') {\n      await new Promise(resolve => setTimeout(resolve, delayMs));\n    }\n    continue;\n  }\n\n  return [{ json: { ...incident, slackStatus: 'failed', slackStatusCode: statusCode, slackAttempts: attempt } }];\n}\n\nreturn [{ json: { ...incident, slackStatus: 'failed', slackAttempts: MAX_RETRIES } }];"
       },
       "id": "slk-01",
       "name": "Slack Notify",
@@ -122,7 +122,7 @@
     },
     {
       "parameters": {
-        "mode": "runOnceForEachItem",
+        "mode": "runOnceForAllItems",
         "jsCode": "// ── Persist Slack failure in workflow static data ────────────────\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.failures) staticData.failures = [];\n\nconst record = {\n  timestamp: new Date().toISOString(),\n  incidentId: $json.incidentId,\n  service: 'slack',\n  statusCode: $json.slackStatusCode ?? null,\n  attempts: $json.slackAttempts\n};\n\nstaticData.failures.push(record);\n\nconsole.error(\n  `[FAILURE] Slack | incident=${record.incidentId} | attempts=${record.attempts} | status=${record.statusCode}`\n);\n\nreturn [{ json: $json }];"
       },
       "id": "logslk-01",
@@ -133,8 +133,8 @@
     },
     {
       "parameters": {
-        "mode": "runOnceForEachItem",
-        "jsCode": "// ── O365 Email with Exponential-Backoff Retry ────────────────────\n// Retries on 429 and 5xx only.  Max attempts: 5.\n\nconst incident = $json;\nconst url = 'http://localhost:4020/me/sendMail';\nconst headers = {\n  'Authorization': 'Bearer ms-test-token',\n  'Content-Type': 'application/json'\n};\nconst payload = {\n  message: {\n    subject: `[${incident.severity}] ${incident.incidentId} — ${incident.title}`,\n    body: {\n      contentType: 'Text',\n      content: `${incident.descriptionShort}\\n\\nCorrelationId: ${incident.correlationId}\\nCreatedAt: ${incident.createdAt}`\n    },\n    toRecipients: [{ emailAddress: { address: incident.ownerEmail } }]\n  },\n  saveToSentItems: false\n};\n\nconst MAX_RETRIES = 5;\n\nfor (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {\n  const response = await fetch(url, {\n    method: 'POST',\n    headers,\n    body: JSON.stringify(payload)\n  });\n\n  if (response.status >= 200 && response.status < 300) {\n    return [{ json: { ...incident, o365Status: 'success', o365Attempts: attempt } }];\n  }\n\n  const retryable = response.status === 429 || response.status >= 500;\n  if (retryable && attempt < MAX_RETRIES) {\n    const delayMs = Math.pow(2, attempt - 1) * 1000;\n    await new Promise(resolve => setTimeout(resolve, delayMs));\n    continue;\n  }\n\n  return [{ json: { ...incident, o365Status: 'failed', o365StatusCode: response.status, o365Attempts: attempt } }];\n}\n\nreturn [{ json: { ...incident, o365Status: 'failed', o365Attempts: MAX_RETRIES } }];"
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ── O365 Email with Exponential-Backoff Retry ────────────────────\n// Retries on 429 and 5xx only.  Max attempts: 5.\n\nconst incident = $json;\nconst url = 'http://localhost:4020/me/sendMail';\nconst headers = {\n  'Authorization': 'Bearer ms-test-token',\n  'Content-Type': 'application/json'\n};\nconst body = {\n  message: {\n    subject: `[${incident.severity}] ${incident.incidentId} — ${incident.title}`,\n    body: {\n      contentType: 'Text',\n      content: `${incident.descriptionShort}\\n\\nCorrelationId: ${incident.correlationId}\\nCreatedAt: ${incident.createdAt}`\n    },\n    toRecipients: [{ emailAddress: { address: incident.ownerEmail } }]\n  },\n  saveToSentItems: false\n};\n\nconst MAX_RETRIES = 5;\n\nfor (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {\n  let statusCode;\n  try {\n    const response = await this.helpers.httpRequest({\n      method: 'POST',\n      url,\n      headers,\n      body,\n      json: true,\n      returnFullResponse: true,\n      ignoreHttpStatusErrors: true\n    });\n    statusCode = response.statusCode;\n  } catch (err) {\n    statusCode = 0;\n  }\n\n  if (statusCode >= 200 && statusCode < 300) {\n    return [{ json: { ...incident, o365Status: 'success', o365Attempts: attempt } }];\n  }\n\n  const retryable = statusCode === 0 || statusCode === 429 || statusCode >= 500;\n  if (retryable && attempt < MAX_RETRIES) {\n    const delayMs = Math.pow(2, attempt - 1) * 1000;\n    if (typeof setTimeout === 'function') {\n      await new Promise(resolve => setTimeout(resolve, delayMs));\n    }\n    continue;\n  }\n\n  return [{ json: { ...incident, o365Status: 'failed', o365StatusCode: statusCode, o365Attempts: attempt } }];\n}\n\nreturn [{ json: { ...incident, o365Status: 'failed', o365Attempts: MAX_RETRIES } }];"
       },
       "id": "o365-01",
       "name": "O365 Email",
@@ -173,7 +173,7 @@
     },
     {
       "parameters": {
-        "mode": "runOnceForEachItem",
+        "mode": "runOnceForAllItems",
         "jsCode": "// ── Persist O365 failure in workflow static data ─────────────────\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.failures) staticData.failures = [];\n\nconst record = {\n  timestamp: new Date().toISOString(),\n  incidentId: $json.incidentId,\n  service: 'o365',\n  statusCode: $json.o365StatusCode ?? null,\n  attempts: $json.o365Attempts\n};\n\nstaticData.failures.push(record);\n\nconsole.error(\n  `[FAILURE] O365 | incident=${record.incidentId} | attempts=${record.attempts} | status=${record.statusCode}`\n);\n\nreturn [{ json: $json }];"
       },
       "id": "logo365-01",
@@ -184,7 +184,7 @@
     },
     {
       "parameters": {
-        "mode": "runOnceForEachItem",
+        "mode": "runOnceForAllItems",
         "jsCode": "// ── Mark dedupeKey as processed so replays are skipped ───────────\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.processedKeys) staticData.processedKeys = {};\n\nstaticData.processedKeys[$json.dedupeKey] = new Date().toISOString();\n\nreturn [{ json: $json }];"
       },
       "id": "recdd-01",
